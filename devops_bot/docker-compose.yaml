@@ -1,0 +1,68 @@
+version: '3'
+
+services:
+
+  db_image:
+    container_name: db_image
+    build:
+      context: ./db_image
+      dockerfile: Dockerfile
+    environment:
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_REPL_USER=${DB_REPL_USER}
+      - DB_REPL_PASSWORD=${DB_REPL_PASSWORD}
+      - DB_DATABASE=${DB_DATABASE}
+    volumes:
+      - pg_logs:/var/log/
+    ports:
+    - ${DB_PORT}:5432
+
+  db_repl_image:
+    container_name: db_repl_image
+    build:
+      context: ./db_repl_image
+      dockerfile: Dockerfile
+    environment:
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_REPL_USER=${DB_REPL_USER}
+      - DB_REPL_PASSWORD=${DB_REPL_PASSWORD}
+    command: |
+      postgres 
+        -c hot_standby=on
+        -c max_connections=200
+    ports:
+    - ${DB_REPL_PORT}:5432
+    depends_on:
+      - db_image
+
+  bot_image:
+    container_name: bot_image
+    build: 
+      context: ./bot_image
+      dockerfile: Dockerfile
+    environment:
+      - TG_TOKEN=${TG_TOKEN}
+      - RM_HOST=${RM_HOST}
+      - RM_PORT=${RM_PORT}
+      - RM_USER=${RM_USER}
+      - RM_PASSWORD=${RM_PASSWORD}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_DATABASE=${DB_DATABASE}
+    volumes:
+      - pg_logs:/var/log/
+    depends_on:
+      - db_image
+      - db_repl_image
+      
+volumes:
+  pg_logs:
+networks:
+  default:
+    name: my_network
