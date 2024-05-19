@@ -1,0 +1,24 @@
+[primary]
+primary_host ansible_host=192.168.190.199 ansible_user=ansible ansible_password=qweqwe
+
+[replica]
+replica_host ansible_host=192.168.190.202 ansible_user=ansible ansible_password=qweqwe
+
+[all:vars]
+TG_TOKEN=
+
+RM_HOST = 192.168.190.199
+RM_PORT = 22
+RM_USER = user
+RM_PASSWORD = qweqwe
+
+DB_USER=admpetr
+DB_PASSWORD=eve@123
+DB_HOST=192.168.190.199
+DB_PORT=5432
+DB_DATABASE=my_database
+
+DB_REPL_USER=rep_user
+DB_REPL_PASSWORD=qweqwe
+DB_REPL_HOST=192.168.190.202
+DB_REPL_PORT=5432

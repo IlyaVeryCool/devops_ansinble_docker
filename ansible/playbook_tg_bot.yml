@@ -1,0 +1,269 @@
+---
+- name: Deploy and configure PostgreSQL and TG bot
+  hosts: all
+  become: yes
+  tasks:
+    - name: Install necessary packages
+      apt:
+        name:
+          - git
+          - sysstat
+          - python3
+          - python3-pip
+          - libpq-dev
+          - python3-dev
+          - python3-venv
+          - postgresql
+          - postgresql-client
+          - postgresql-contrib
+          - postgresql-common
+        state: present
+        update_cache: yes
+
+    - name: Install psycopg2 Python library
+      pip:
+        name: psycopg2-binary
+        state: present
+
+- name: Configure and start PostgreSQL on primary
+  hosts: primary
+  become: yes
+  vars:
+    db_name: "{{ DB_DATABASE }}"
+    db_user: "{{ DB_USER }}"
+    db_password: "{{ DB_PASSWORD }}"
+    db_port: "{{ DB_PORT }}"
+    replication_user: "{{ DB_REPL_USER }}"
+    replication_password: "{{ DB_REPL_PASSWORD }}"
+  tasks:
+
+    - name: Create PostgreSQL archive directory
+      file:
+        path: "/oracle/pg_data/archive"
+        owner: postgres
+        group: postgres
+        state: directory
+
+    - name: Start PostgreSQL service
+      systemd:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Discover PostgreSQL version
+      command: "psql -V"
+      register: psql_version_output
+
+    - name: Set PostgreSQL version variable
+      set_fact:
+        postgres_version: "{{ psql_version_output.stdout.split(' ')[2].split('.')[0] }}"
+    
+    - name: Update postgresql.conf
+      blockinfile:
+        path: "/etc/postgresql/{{ postgres_version }}/main/postgresql.conf"
+        block: | 
+          listen_addresses = '*'
+          port = {{DB_PORT}}
+          log_destination = 'stderr'
+          logging_collector = on
+          log_directory = '/var/log/postgresql/'
+          log_filename = 'postgresql.log'
+          log_file_mode = 0644
+          archive_mode = on
+          archive_command = 'cp %p /oracle/pg_data/archive/%f'
+          max_wal_senders = 10
+          wal_level = replica
+          wal_log_hints = on
+          log_replication_commands = on
+  
+    - name: Configure pg_hba.conf
+      template:
+        src: pg_hba.conf
+        dest: "/etc/postgresql/{{ postgres_version }}/main/pg_hba.conf"
+   
+    - name: restart postgresql
+      service:
+        name: postgresql
+        state: restarted
+      become: true
+
+    - name: Create replication user
+      become: true
+      postgresql_user:
+        name: "{{ replication_user }}"
+        password: "{{ replication_password }}"
+        role_attr_flags: REPLICATION,LOGIN
+        state: present
+
+    - name: Create database user
+      postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        state: present
+
+    - name: Create the database
+      postgresql_db:
+        name: "{{ db_name }}"
+        state: present
+
+    - name: Create necessary tables
+      postgresql_query:
+        db: "{{ db_name }}"
+        query: |
+          CREATE TABLE IF NOT EXISTS emails (
+            id SERIAL PRIMARY KEY,
+            email VARCHAR(255) NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS phone_numbers (
+            id SERIAL PRIMARY KEY,
+            phone_number VARCHAR(20) NOT NULL
+          );
+
+    - name: Grant privileges to database user
+      postgresql_privs:
+        db: "{{ db_name }}"
+        objs: "emails,phone_numbers"
+        privs: "SELECT,INSERT"
+        type: table
+        roles: "{{ db_user }}"
+
+    - name: Grant privileges on phone_numbers_id_seq, emails_id_seq sequence
+      become: yes
+      postgresql_privs:
+        db: "{{ db_name }}"
+        objs: "phone_numbers_id_seq,emails_id_seq"
+        privs: USAGE,SELECT
+        type: sequence
+        roles: "{{ db_user }}"
+
+    - name: Check if replication slot exists
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        query: "SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replication_slot';"
+      register: slot_check
+
+    - name: Create replication slot
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        query: "SELECT pg_create_physical_replication_slot('replication_slot');"
+      when: slot_check.rowcount == 0
+
+    - name: Restart PostgreSQL service
+      systemd:
+        name: postgresql
+        state: restarted
+
+- name: Configure PostgreSQL replica
+  hosts: replica
+  become: yes
+  vars:
+    replication_user: "{{ DB_REPL_USER }}"
+    replication_password: "{{ DB_REPL_PASSWORD }}"
+    primary_host: "{{ DB_HOST }}"
+    primary_port: "{{ DB_PORT }}"
+    db_repl_port: "{{ DB_REPL_PORT }}"
+  tasks:
+    - name: Discover PostgreSQL version
+      command: "psql -V"
+      register: psql_version_output
+
+    - name: Set PostgreSQL version variable
+      set_fact:
+        postgres_version: "{{ psql_version_output.stdout.split(' ')[2].split('.')[0] }}"
+
+    - name: Update postgresql.conf
+      blockinfile:
+        create: true
+        path: "/etc/postgresql/{{ postgres_version }}/main/postgresql.conf"
+        block: |
+          listen_addresses = 'localhost, {{DB_REPL_HOST}}'
+          port = {{DB_REPL_PORT}}
+      become: yes
+      become_user: root
+
+    - name: Stop PostgreSQL service
+      systemd:
+        name: postgresql
+        state: stopped
+
+    - name: Clean up directory
+      ansible.builtin.file:
+        state: "{{item}}"
+        path: "/var/lib/postgresql/{{ postgres_version }}/main"
+        owner: postgres
+        group: postgres
+        mode: 0750
+      with_items:
+        - absent
+        - directory
+      become: yes
+      become_user: root
+
+    - name: Perform base backup
+      become: true
+      command: 
+        cmd: |
+          pg_basebackup -v -R -h {{ primary_host }} -p {{ primary_port }} -U {{ replication_user }} -w -P -D /var/lib/postgresql/{{ postgres_version }}/main
+      become_user: postgres
+      environment:                  
+        PGPASSWORD: "{{ replication_password }}"
+
+    - name: Start PostgreSQL service
+      systemd:
+        name: postgresql
+        state: started
+      become: yes
+      become_user: root
+
+- name: Deploy TG bot
+  hosts: primary
+  become: yes
+  vars:
+    repo_url: "https://github.com/IlyaVeryCool/devops_ansinble_docker.git"
+    bot_directory: "/opt/tg_bot/devops_bot/bot_image"
+  tasks:
+    - name: Clone tg-bot repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "/opt/tg_bot"
+        version: docker
+
+    - name: Set up Python virtual environment
+      pip:
+        requirements: "{{ bot_directory }}/requirements.txt"
+        virtualenv: "{{ bot_directory }}/venv"
+        virtualenv_command: python3 -m venv
+        state: present
+
+
+    - name: Create .env file for bot
+      copy:
+        dest: "{{ bot_directory }}/.env"
+        content: |
+          TG_TOKEN={{ TG_TOKEN }}
+          RM_HOST={{ RM_HOST }}
+          RM_PORT={{ RM_PORT }}
+          RM_USER={{ RM_USER }}
+          RM_PASSWORD={{ RM_PASSWORD }}
+          DB_USER={{ DB_USER }}
+          DB_PASSWORD={{ DB_PASSWORD }}
+          DB_HOST={{ DB_HOST }}
+          DB_PORT={{ DB_PORT }}
+          DB_DATABASE={{ DB_DATABASE }}
+
+    - name: Check if bot is running
+      become: yes
+      shell: ps aux | grep './venv/bin/python bot.py' | grep -v grep
+      register: bot_status
+      ignore_errors: yes
+
+    - name: Shutdown bot if it's running
+      become: yes
+      shell: "pkill -f './venv/bin/python bot.py'"
+      when: bot_status.rc == 0
+      ignore_errors: yes
+
+    - name: Start tg-bot
+      shell: |
+        cd {{ bot_directory }}
+        ./venv/bin/python bot.py &
